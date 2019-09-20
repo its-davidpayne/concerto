@@ -160,7 +160,7 @@ class ConcertoSection(object):
                     # for discussion.
 ##                    ucursor.deleteRow()
                     invalid_rows += 1
-                    message("@ '{}' is niot a valid {}. Removed row".format(
+                    message("@ '{}' is not a valid {}. Removed row".format(
                             row[0], self.shape_key_field))
         return valid_rows, invalid_rows
     
@@ -460,16 +460,16 @@ class ConcertoSection(object):
         assert item.endswith(".shp") and not item.startswith("__")
         new_name = "__{}".format(item)
         item_path = os.path.join(MAIN_SHAPE_PATH, self.shapefile_folder, item)
-        new_path = os.path.join(MAIN_SHAPE_PATH, sef.shapefile_folder, new_name)
+        new_path = os.path.join(MAIN_SHAPE_PATH, self.shapefile_folder, new_name)
         try:
-            arcpy.Rename_management(item_path, new_path))
+            arcpy.Rename_management(item_path, new_path)
             message("{} renamed to {}".format(item, new_name))
         except Exception as e:
             message("~ Unable to rename {}. Please check".format(item))
             # raise
             # commented out as we haven't implemented logic to handle locked
             # files (or any other reason renaming might have failed). For now
-            # it's just marked as an error and can be investigated manuallly.
+            # it's just marked as an error and can be investigated manually.
     
     def retire_old_files(self):
         """ Deletes files over 30 days old.
@@ -515,7 +515,7 @@ class Sandbox(object):
         message("**************************************************")
         env.workspace = SANDBOX
         old_fcs = [item for item in arcpy.ListFeatureClasses() if
-                   item.endswith("_old") or itm.endswith("_new")]
+                   item.endswith("_old") or item.endswith("_new")]
         for item in old_fcs:
             try:
                 arcpy.Delete_management(os.path.join(SANDBOX, item))
@@ -524,4 +524,181 @@ class Sandbox(object):
                         item, str(e)))
                 # raise
         for fc in self.fc_list:
-            concerto_path = 
+            concerto_path = os.path.join(MAIN_PATH, fc)
+            sandbox_path = os.path.join(SANDBOX, fc)
+            new_sandbox_path = "{}_new".format(sandbox_path)
+            old_sandbox_path = "{}_old".format(sandbox_path)
+            try:
+                arcpy.Copy_management(concerto_path, new_sandbox_path)
+                message("Copied Concerto\\{} to Sandbox\\{}".format(
+                    fc, os.path.basename(new_sandbox_path)))
+                try:
+                    arcpy.Rename_management(sandbox_path, old_sandbox_path)
+                    message("Renamed Sandbox\\{} to Sandbox\\{}".format(
+                        fc, os.path.basename(old_sandbox_path)))
+                    try:
+                        arcpy.Rename_management(new_sandbox_path, sandbox_path)
+                        message("Renamed Sandbox\\{} to Sandbox\\{}".format(
+                            os.path.basename(new_sandbox_path), fc))
+                    except Exception as e:
+                        message("~ Unable to rename Sandbox\\{} to Sandbox\\{}.\n{}".format(
+                            os.path.basename(new_sandbox_path), fc, str(e)))
+                        #raise
+                except Exception as e:
+                    message("~ Unable to rename Sandbox\\{} to Sandbox\\{}.\n{}".format(
+                        fc, os.path.basename(old_sandbox_path), str(e)))
+                    #raise
+            except Exception as e:
+                message(("~ Unable to copy Concerto\\{} to Sandbox\\{} - User may "
+                    "have map open.\n{}").format(fc, str(e)))
+                #raise
+        env.workspace = MAIN_PATH
+        message("**************************************************")
+        message("Finished Updating Sandbox GeoDatabase".center(50))
+        message("**************************************************")
+
+    def verify(self):
+        """ Checks that the sandbox created by update() is identical to 
+        the main geodatabase
+        """
+        message("**************************************************")
+        message("Checking integrity of Sandbox GeoDatabase".center(50))
+        message("**************************************************")
+        env.workspace = SANDBOX
+        # This section checks that the table structures match
+        live_sandbox_fcs = [name for name in arcpy.ListFeatureClasses()
+                            if name.endswith("Live") or name.endswith("REC")]
+        env.workspace = MAIN_PATH
+        live_main_fcs = [name for name in arcpy.ListFeatureClasses()
+                         if name.endswith("Live") or name.endswith("REC")]
+        if not sorted(live_main_fcs) == sorted(live_sandbox_fcs):
+            message("~ Feature Classes do not match:")
+            # Prints a lovely table of mismatching Fields. It's almost
+            # a shame this will probably never run.
+            for row in itertools.izip_longest(sorted(live_main_fcs),
+                                              sorted(live_sandbox_fcs),
+                                              fillvalue="---"):
+                message(row)
+            #raise ValueError
+        # This section checks that the table contents match
+        for fc in live_main_fcs:
+            main_fields = [field.name for field in arcpy.ListFields(
+                os.path.join(MAIN_PATH, fc))]
+            sand_fields = [field.name for field in arcpy.ListFields(
+                os.path.join(SANDBOX, fc))]
+            if not main_fields == sand_fields:
+                message("~ Fields in {} do not match".format(fc))
+                raise ValueError
+            with arcpy.da.SearchCursor(os.path.join(MAIN_PATH, fc),
+                                       main_fields) as maincursor:
+                main_data = [row for row in maincursor]
+            with arcpy.da.SearchCursor(os.path.join(SANDBOX, fc),
+                                       sand_fields) as sandcursor:
+                sand_data = [row for row in sandcursor]
+            if not len(main_data) == len(sand_data):
+                message("~ Number of rows in {} does not match".format(fc))
+                raise ValueError
+            for i in range(len(main_data)):
+                if not main_data[i] == sand_data[i]:
+                    message("~ {} Row {} contents do not match".format(fc, i+1))
+                    #raise ValueError
+            message("{} lines in {} checked".format(len(main_data), fc))
+        env.workspace = MAIN_PATH
+        message("**************************************************")
+        message("Sandbox contents checked".center(50))
+        message("**************************************************")
+
+###############################################################################
+
+class FieldUpdater(object):
+    """ Checks CPAD against Concerto to see whether certain fields have
+    changed. If so propagates those changes into the gdb.
+
+    Changes to what fields need checking are as simple as editing the 
+    {fields_dict}
+    """
+    def __init__(self, fc_prefix):
+        """ fc_prefix is the name of the section as used in the feature class
+        names. It's also used as the key in the dicts below.
+        """
+        self.fc_prefix = fc_prefix
+        self.fields_dict = {
+            "Disposals":    ["Transaction_Type",
+                             "Transaction_Status",
+                             "Purpose",
+                             "Agreement_Date",
+                             "Transaction_Party_Name",
+                             "Price",
+                             "Deed",
+                             "Managed_By"],
+            # If any fields are added to Cases here you'll need to delete 
+            # line 'if not self.feature_class_prefix == "Cases":' from 
+            # ConcertoSection.wrapper and uncomment a section in 
+            # concerto_v4.py where CasesUpdater is commented out.
+            "Cases":        [],
+            "Leases":       ["Transaction_Type",
+                             "Transaction_Status",
+                             "Purpose",
+                             "Agreement_Date",
+                             "Transaction_Party_Name",
+                             "Commencement_Date",
+                             "Term",
+                             "Price",
+                             "Deed",
+                             "Managed_By",
+                             "Current_Rental_Amount"],
+            "Sites":        ["SITE_NAME",
+                             "SITESTATUS",
+                             "OWNERSHIPDETAIL",
+                             "OPERATIONAL_STATUS",
+                             "SITE_MANAGEDBY",
+                             "SITEFUNCTIONDETAIL"]
+        }
+        self.concerto_keys = {
+            "Disposals": "REFVAL",
+            "Cases"    : "REFVAL",
+            "Leases"   : "REFVAL",
+            "Sites"    : "UPRN"
+        }
+        self.cpad_keys = {
+            "Disposals": "EstatesRef",
+            "Cases"    : "Job_Number",
+            "Leases"   : "EstatesRef",
+            "Sites"    : "SITE_UPRN"
+        }
+        message("Checking {} records".format(self.fc_prefix))
+    
+    def update(self):
+        """ Performs the checking, updating.
+        """
+        for field in self.fields_dict[self.fc_prefix]:
+            # populate temp dicts with keys (unique fields) and values from
+            # Section_Live and Section_CPAD
+            live_path = os.path.join(MAIN_PATH, "{}_Live".format(self.fc_prefix))
+            cpad_path = os.path.join(MAIN_PATH, "{}_CPAD".format(self.fc_prefix))
+            with arcpy.da.SearchCursor(live_path,
+                [self.concerto_keys[self.fc_prefix],
+                field]) as gdbscursor:
+                gdbdic = {row[0]:row[1] for row in gdbscursor}
+            with arcpy.da.SearchCursor(cpad_path,
+                [self.cpad_keys[self.fc_prefix],
+                field]) as sqlscursor:
+                sqldic = {row[0]:row[1] for row in sqlscursor}
+            changed_fields = {key:value for key, value in sqldic.iteritems()
+                if key in gdbdic and gdbdic[key] != value}
+            if changed_fields:
+                total = 0
+                for key, value in changed_fields.iteritems():
+                    try:
+                        with arcpy.da.UpdateCursor(live_path,
+                            [self.concerto_keys[self.fc_prefix], field]) as ucursor:
+                            for row in ucursor:
+                                if row[0] == key:
+                                    row[1] = value
+                                    ucursor.updateRow(row)
+                                    total += 1
+                    except Exception as e:
+                        message("~ Unable to update {}. {}".format(row[0], str(e)))
+                message("{} {} records updated".format(total, field))
+            else:
+                message("No {} updates to process".format(field))
